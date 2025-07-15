@@ -8,11 +8,10 @@
 
 #include "bitmap.h"
 
-/*
 extern "C" {
 #include "rgbe.h"
 }
-struct RGBE {
+struct RGBEImage {
 	int w, h;
 	std::vector<float3> data;
 
@@ -47,7 +46,6 @@ struct RGBE {
 		return true;
 	}
 };
-*/
 
 template <typename T>
 struct is_valid_cuda_var : std::false_type {};
@@ -158,8 +156,6 @@ __device__ __constant__ float kBloomSoftness;
 __device__ __constant__ float3 kBloomFactor;
 
 void setCudaExposure(float exposure) {
-	CLAMP(exposure, 0.0f, 1.0f);
-	//cudaMemcpyToSymbol("kBloomThreshold", &threshold, sizeof(float));
 	cudaMemcpyToSymbol(kExposure, &exposure, sizeof(float));
 }
 
@@ -214,8 +210,8 @@ __device__ __host__ float3 to_standard(float3 c) {
 	return c;
 }
 
-__device__ __host__ float luminance(float3 c) {
-	float3 lin_c = to_linear(c);
+__device__ __host__ float luminance(float3 c, bool isLinear) {
+	float3 lin_c = isLinear ? c : to_linear(c);
 	return 0.2126f * lin_c.x + 0.7152f * lin_c.y + 0.0722f * lin_c.z;
 }
 
@@ -248,7 +244,7 @@ __device__ __host__ float3 f3madd(float s, float3 u, float3 v) {
 	return u;
 }
 
-__global__ void bloom_extract_kernel(const float3* input, float3* output, int w, int h) {
+__global__ void bloom_extract_kernel(const float3* input, float3* output, int w, int h, bool isLinear = true) {
 	const int tile_dim = BLOCK_DIM * 2;
 	const int halo_dim = BLOCK_DIM / 2;
 	const float3 zero = { 0.0f, 0.0f, 0.0f };
@@ -270,8 +266,9 @@ __global__ void bloom_extract_kernel(const float3* input, float3* output, int w,
 		for (int i = 0; i < 2; i++)
 			for (int j = 0; j < 2; j++) {
 				int idx = (y + i) * tile_dim + x + j;
-				float3 c = to_linear(input_sample(gx + j, gy + i));
-				float weight = bloom_weight(luminance(c));
+				float3 c = input_sample(gx + j, gy + i); // to_linear(input_sample(gx + j, gy + i));
+				c = isLinear ? c : to_linear(c);
+				float weight = bloom_weight(luminance(c, true));
 				tile[idx] = f3muls(weight, c);
 			}
 		__syncthreads();
@@ -313,23 +310,27 @@ __global__ void bloom_extract_kernel(const float3* input, float3* output, int w,
 	output[gy * w + gx] = f3madd( kBloomFactor.x, core_spread, f3madd(kBloomFactor.y, medium_spread, f3muls(kBloomFactor.y, wide_spread)));
 }
 
-__global__ void bloom_apply_kernel(const float3* input, float3* bloom, float3 *output, int w, int h) {
+__global__ void bloom_apply_kernel(const float3* input, float3* bloom, float3 *output, int w, int h, bool isLinear = true) {
+	const float3 zero = { 0.0f, 0.0f, 0.0f };
+
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 	int idx = y * w + x;
-	float3 v = to_linear(input[idx]);
+	float3 v = isLinear ? input[idx] : to_linear(input[idx]);
+	v = f3muls(exp2f(kExposure), v);
 
-	float lum = luminance(v);
-	float lum_tmap = lum / (lum + 1.0f);	// Reinhard  tone-mapping
-	v = f3muls(lum_tmap / lum, v);
+	float lum = luminance(v, true);
+	float lum_tmap = lum / (lum + 1.0f);	// Reinhard tone-mapping
+	v = lum < 1e-4 ? zero : f3muls(lum_tmap / lum, v);
 	v = f3add(v, bloom[idx]);
+	v = to_standard(v);
 	CLAMP(v.x, 0.0f, 1.0f);
 	CLAMP(v.y, 0.0f, 1.0f);
 	CLAMP(v.z, 0.0f, 1.0f);
-	output[idx] = to_standard(v);
+	output[idx] = v;
 }
 
-__global__ void log_average_kernel(const float3 *input, float *output) {
+__global__ void log_average_kernel(const float3 *input, float *output, bool isLinear = true) {
 	// assume block size = warp size, input size = number of blocks * warp size, and output size = input size / warp size, or block size
 
 	int lane = (threadIdx.x & 0x1f);
@@ -338,7 +339,7 @@ __global__ void log_average_kernel(const float3 *input, float *output) {
 	// parallel tree reduction - an insane technique for using a binary tree structure for summing.
 	// also known as logarithmic reduction
 
-	//float log_sum = logf(1e-4f + luminance(input[i]));
+	//float log_sum = logf(1e-4f + luminance(input[i], isLinear));
 	//for (int offset = 16; offset > 0; offset /= 2)
 	//	log_sum += __shfl_down_sync(0xffffffff, log_sum, offset);	// shuffle down reads from higher indices
 	//if (lane == 0)
@@ -347,7 +348,7 @@ __global__ void log_average_kernel(const float3 *input, float *output) {
 	// the pedagogically clear, manually staged version. 
 	float log_sums[6];	//0,1,2,4,8,16
 	int step = 1;
-	log_sums[0] = logf(1e-4f + luminance(input[i]));
+	log_sums[0] = logf(1e-4f + luminance(input[i], isLinear));
 	for (int offset = 1; offset <= 16; offset *= 2, step++) {
 		log_sums[step] = log_sums[step - 1] + __shfl_sync(0xffffffff, log_sums[step - 1], lane + offset);
 	}
@@ -386,15 +387,50 @@ bool loadBitmap(CudaArray<float3>& input, int& w, int& h, const char* bitmapName
 		input.host[i].x = float(image[i * 3 + 2]) / 255.0;
 	}
 	input.push();
+	return true;
+}
+
+bool loadHDR(CudaArray<float3>& input, int& w, int& h, const char* hdrFileName) {
+	RGBEImage image;
+	if (!image.load(hdrFileName))
+		return false;
+	printf("image %d x %d\n", image.w, image.h);
+	if (image.w & 0x1f || image.h & 0x1f) {
+		printf("%s - hdr image '%s' dimensions are not a multiple of 32\n", __FUNCTION__, hdrFileName);
+		return false;
+	}
+	w = image.w;
+	h = image.h;
+	input.alloc(w * h);
+	float min = +INFINITY;
+	float max = -INFINITY;
+	for (int i = 0; i < w * h; i++) {
+		input.host[i] = image.data[i];
+		min = std::min(min, input.host[i].x);
+		min = std::min(min, input.host[i].y);
+		min = std::min(min, input.host[i].z);
+		max = std::max(max, input.host[i].x);
+		max = std::max(max, input.host[i].y);
+		max = std::max(max, input.host[i].z);
+	}
+	printf("%s - min | max: %f | %f\n", __FUNCTION__, to_srgb(min), to_srgb(max));
+	input.push();
+	return true;
 }
 
 void saveBitmap(CudaArray<float3>& input, int w, int h, const char* bitmapName) {
 	input.pull();
 	std::vector<uint8_t> pixels(w * h * 3);
 	for (int i = 0; i < w * h; i++) {
-		pixels[i * 3 + 0] = uint8_t(input.host[i].z * 255.0);
-		pixels[i * 3 + 1] = uint8_t(input.host[i].y * 255.0);
-		pixels[i * 3 + 2] = uint8_t(input.host[i].x * 255.0);
+		float b = input.host[i].z * 255.0;
+		float g = input.host[i].y * 255.0;
+		float r = input.host[i].x * 255.0;
+		CLAMP(b, 0.0, 255.0);
+		CLAMP(g, 0.0, 255.0);
+		CLAMP(r, 0.0, 255.0);
+		pixels[i * 3 + 0] = uint8_t(b);
+		pixels[i * 3 + 1] = uint8_t(g);
+		pixels[i * 3 + 2] = uint8_t(r);
 	}
 	exportBMP(pixels, w, h, bitmapName);
 }
@@ -422,6 +458,7 @@ int main()
 		return 0;
 	}
 
+
 	int w, h;
 	CudaArray<float3> input, bloom, output;
 	int numds = 0;
@@ -432,10 +469,17 @@ int main()
 	cudaEvent_t e0, e1;
 	float ms = 0.0f;
 
-	if (!loadBitmap(input, w, h, "input.bmp")) {
+	//if (!loadBitmap(input, w, h, "input.bmp")) {
+	//	cudaDeviceReset();
+	//	return 0;
+	//}
+
+	if (!loadHDR(input, w, h, "input.hdr")) {
 		cudaDeviceReset();
 		return 0;
 	}
+	//saveBitmap(input, w, h, "linear_uncapped.bmp");
+
 	bloom.alloc(w * h);
 	output.alloc(w * h);
 	int size = w * h;
@@ -472,8 +516,10 @@ int main()
 	block = dim3(BLOCK_DIM, BLOCK_DIM);
 	grid = dim3(w / BLOCK_DIM, h / BLOCK_DIM);
 
-	setCudaBloomThreshold(to_linear(0.1) * lumAvg);
-	setCudaBloomSoftness(0.4);
+
+	setCudaExposure(1.0f);
+	setCudaBloomThreshold(to_linear(0.5) * lumAvg);
+	setCudaBloomSoftness(0.1);
 	setCudaBloomFactor({0.333f, 0.333f, 0.333f});
 	cudaEventRecord(e0);
 	bloom_extract_kernel << <grid, block >> > (input.devptr, bloom.devptr, w, h);
