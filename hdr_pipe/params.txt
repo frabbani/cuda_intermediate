@@ -1,0 +1,21 @@
+# ExposureValue: 
+#   Controls the simulated camera exposure level. This is a logarithmic value in EV units (Exposure Value).
+#
+# GrayKey: 
+#   defines the reference gray luminance used in tone mapping. Based on photographic tone reproduction models.
+#   0.18 is standard middle gray (18% reflectance), mimicking camera/eye adaptation to average light.
+#   Lowering this value darken the image. Raising it will map more of the image towards midtones.
+#
+# InScatterAttenuation:
+#   Controls how bloom contribution attenuates through the lense during inscattering.
+#   Higher values restrict bloom to only very bright areas. Lower values allow bloom spread from lesser.
+
+# InScatterWeights:
+#   Defines the relative contribution of small, medium, large and extra large bloom spreads respectively.
+#   This shapes the bloom profile. The 4 values must be comma separated. The values are normalized, ie the 
+#   sum contribution of these weights will always be 1.
+#
+ExposureValue 0
+GrayKey 0.18
+InScatterAttenuation 3.0
+InScatterWeights 4,3,2,1

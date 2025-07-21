@@ -1,0 +1,35 @@
+@startuml
+
+participant "File System" as FS
+participant "Host Service" as Host
+participant "CUDA Symbols" as Syms
+participant "CUDA Stream: Luminance Average" as Lum
+participant "CUDA Stream: Bloom Effect" as Bloom
+participant "CUDA Stream: Global Composition" as Global
+
+== Input Phase ==
+FS -> Host: Load HDR image
+FS -> Host: Load control parameters
+Host -> Syms: Upload symbols (exposure, gray key, bloom alpha, weights)
+
+== Processing Phase ==
+activate Lum
+activate Bloom
+Host -> Lum: Launch log-average luminance kernels
+Host -> Bloom: Launch in-scatter/bloom extraction & mipmap blur kernels
+Syms -> Bloom: Access bloom alpha and weights
+Lum --> Host: Return average log luminance
+Bloom --> Host: Return composite bloom result
+deactivate Lum
+deactivate Bloom
+Host -> FS: Save bloom and mipmap outputs
+
+== Aggregation Phase ==
+activate Global
+Host -> Global: Launch tone-mapping kernel with image + bloom + luminance
+Syms -> Global: Access tone-mapping and exposure params
+Global --> Host: Return final tone-mapped image
+deactivate Global
+Host -> FS: Save final output image
+
+@enduml

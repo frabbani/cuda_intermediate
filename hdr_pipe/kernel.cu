@@ -699,8 +699,8 @@ namespace globals {
 			return false;
 		}
 
-		h = image.w;
 		w = image.w;
+		h = image.h;
 		if (image.w & 0x7f || image.h & 0x7f) {
 			printf("%s - heads up! HDR image '%s' dimensions are not a multiples of 128, upscaling it\n", __FUNCTION__, hdrFileName);
 			if (w & 0x7f) {
@@ -778,7 +778,73 @@ class Main {
 	float lumAvg = 0.0f;
 	cudaStream_t streamLum, streamBloom;
 	CudaEventPair globalEventPair, lumCalcEventPair, mipBloomEventPair;
+
+	float EV = -2.0f;
+	float grayKey = 0.18f;
+	float inScatterAttenuation = 1.0f;
+	float4 inScatterWeights = { 8.0f, 4.0f, 2.0f, 1.0f };
 public:
+	void parseParameterList() {
+		FILE* fp = fopen("params.txt", "r");
+		const char* params[] = {
+			"ExposureValue",
+			"GrayKey",
+			"InScatterAttenuation",
+			"InScatterWeights",
+		};
+
+		const int numParams = sizeof(params) / sizeof(const char*);
+		auto match = [&](const char* field) 
+			{
+				for (int i = 0; i < numParams; i++)
+					if (0 == strcmp(params[i], field))
+						return i;
+				return -1;
+			};
+
+		if (fp) {
+			char line[256];
+			while (fgets(line, sizeof(line), fp)) {
+				if (line[0] == '#')
+					continue;
+				char* toks[2];
+				toks[0] = strtok(line, " ");
+				int p = match(toks[0]);
+				if (-1 == p)
+					continue;
+				toks[1] = strtok(nullptr, " \n");
+				switch (p) {
+				case 0: 
+					EV = atof(toks[1]);
+					break;
+				case 1:
+					grayKey = atof(toks[1]);
+					break;
+				case 2:
+					inScatterAttenuation = atof(toks[1]);
+					break;
+				case 3:
+					char* toktok;
+					toktok = strtok(toks[1], ",");
+					if (toktok)
+						inScatterWeights.x = atof(toktok);
+					toktok = strtok(nullptr, ",");
+					if (toktok)
+						inScatterWeights.y = atof(toktok);
+					toktok = strtok(nullptr, ",");
+					if (toktok)
+						inScatterWeights.z = atof(toktok);
+					toktok = strtok(nullptr, " ,\n");
+					if (toktok)
+						inScatterWeights.w = atof(toktok);
+					break;
+				default: break;
+				}
+			}
+			fclose(fp);
+		}
+	}
+
 	bool init() {
 		auto createDownsample = [](CudaArray<float>& output, int& size)
 			{
@@ -802,7 +868,11 @@ public:
 				return false;
 			};
 
-		if (!globals::loadHDR(input, inputWidth, inputHeight, "input2.hdr"))
+		parseParameterList();
+		printf("EV = %.2f, GrayKey = %.2f, InScatterAttenuation = %.2f, InScatterWeights = {%.2f,%.2f,%.2f,%.2f}\n",
+			EV, grayKey, inScatterAttenuation, inScatterWeights.x, inScatterWeights.y, inScatterWeights.z, inScatterWeights.w);
+
+		if (!globals::loadHDR(input, inputWidth, inputHeight, "input4.hdr"))
 			return false;
 
 		cudaStreamCreate(&streamLum);
@@ -848,10 +918,10 @@ public:
 	}
 
 	void setSymbols() {
-		setCudaExposure(-8.0f);
-		setCudaGrayKey(0.18f);
-		setCudaBloomAlpha(1.0);
-		setCudaBloomFactor({ 4.0f, 3.0f, 2.0f, 1.0f });
+		setCudaExposure(EV);
+		setCudaGrayKey(grayKey);
+		setCudaBloomAlpha(inScatterAttenuation);
+		setCudaBloomFactor(inScatterWeights);
 	}
 
 	void buildBlurMips() {
@@ -947,6 +1017,7 @@ public:
 
 	void term() {
 		input.free();
+		bloom.free();
 		output.free();
 		for (int i = 0; i < numDownsamples; i++)
 			downsamples[i].free();
@@ -954,8 +1025,8 @@ public:
 			mips[i].free();
 
 		globalEventPair.destroy();
-		lumCalcEventPair.destroy();
 		mipBloomEventPair.destroy();
+		lumCalcEventPair.destroy();
 
 		cudaStreamDestroy(streamLum);
 		cudaStreamDestroy(streamBloom);
