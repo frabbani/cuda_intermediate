@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <vector>
 #include <array>
+#include <cassert>
 
 #include "bitmap.h"
 
@@ -113,6 +114,7 @@ struct CudaArray {
 
 #define IMAGE_DIM   1024
 #define BLOCK_DIM   16
+#define BLOCK_DIM_SMALL	8
 #define WARP_SIZE	32
 
 //sum = 256
@@ -457,8 +459,10 @@ __global__ void average_kernel(const float* input, float* output) {
 
 //generate first level blur
 __global__ void bloom_extract_and_blur_5x5_kernel(const float3* input, float3* output, int w, int h, bool isLinear = true) {
-	const int tile_dim = BLOCK_DIM * 2;
-	const int halo_dim = BLOCK_DIM / 2;
+	assert(blockDim.x == blockDim.y);
+
+	const int tile_dim = blockDim.x * 2;
+	const int halo_dim = blockDim.x / 2;
 	const float3 zero = { 0.0f, 0.0f, 0.0f };
 
 	auto input_sample = [&](int x, int y)
@@ -468,7 +472,7 @@ __global__ void bloom_extract_and_blur_5x5_kernel(const float3* input, float3* o
 			return input[y * w + x];
 		};
 
-	__shared__ float3 tile[tile_dim * tile_dim];
+	extern __shared__ float3 tile[];
 	{
 		int x = 2 * threadIdx.x;
 		int y = 2 * threadIdx.y;
@@ -512,8 +516,9 @@ __global__ void bloom_extract_and_blur_5x5_kernel(const float3* input, float3* o
 }
 
 __global__ void mip_and_blur_5x5_kernel(const float3* input, int w, int h, float3* output) {
-	const int tile_dim = BLOCK_DIM * 2;
-	const int halo_dim = BLOCK_DIM / 2;
+	assert(blockDim.x == blockDim.y);
+	const int tile_dim = blockDim.x * 2;
+	const int halo_dim = blockDim.y / 2;
 	const float3 zero = { 0.0f, 0.0f, 0.0f };
 	auto sample_input = [&](int x, int y)
 		{
@@ -527,7 +532,7 @@ __global__ void mip_and_blur_5x5_kernel(const float3* input, int w, int h, float
 			return out;
 		};
 
-	__shared__ float3 tile[tile_dim * tile_dim];
+	extern __shared__ float3 tile[];
 	{
 		int x = 2 * threadIdx.x;
 		int y = 2 * threadIdx.y;
@@ -568,8 +573,10 @@ __global__ void mip_and_blur_5x5_kernel(const float3* input, int w, int h, float
 }
 
 __global__ void combine_mips_and_blur_5x5_kernel(float3* output, int w, int h, const float3* mip0, const float3* mip1, const float3* mip2, const float3* mip3) {
-	const int tile_dim = BLOCK_DIM * 2;
-	const int halo_dim = BLOCK_DIM / 2;
+	assert(blockDim.x == blockDim.y);
+
+	const int tile_dim = blockDim.x * 2;
+	const int halo_dim = blockDim.x / 2;
 	const float3 zero = { 0.0f, 0.0f, 0.0f };
 	float inv_w = 1.0 / float(w);
 	float inv_h = 1.0 / float(h);
@@ -596,7 +603,7 @@ __global__ void combine_mips_and_blur_5x5_kernel(float3* output, int w, int h, c
 			//return f3madd(a.x, c0, f3madd(a.y, c1, f3madd(a.z, c2, f3muls(a.w, c3))));
 
 		};
-	__shared__ float3 tile[tile_dim * tile_dim];
+	extern __shared__ float3 tile[];
 	{
 		int x = 2 * threadIdx.x;
 		int y = 2 * threadIdx.y;
@@ -928,36 +935,39 @@ public:
 		int w = inputWidth;
 		int h = inputHeight;
 
-		dim3 block = dim3(BLOCK_DIM, BLOCK_DIM);
-		dim3 grid = dim3(w / BLOCK_DIM, h / BLOCK_DIM);
+		int blockDim = 16;
+		int tileDim = blockDim * 2;
+		dim3 block = dim3(blockDim, blockDim);
+		dim3 grid = dim3(w / blockDim, h / blockDim);
+		int tileSize = sizeof(float3) * tileDim * tileDim;
 
 		mipBloomEventPair.setStream(streamBloom);
 		mipBloomEventPair.start();
-		bloom_extract_and_blur_5x5_kernel << <grid, block, 0, streamBloom >> > (input.devptr, output.devptr, w, h);
+		bloom_extract_and_blur_5x5_kernel << <grid, block, tileSize, streamBloom >> > (input.devptr, output.devptr, w, h);
 		grid.x /= 2;
 		grid.y /= 2;
 		//mip_kernel << <grid, block, 0, stream >> > (output.devptr, w, h, mips[0].devptr);
-		mip_and_blur_5x5_kernel << <grid, block, 0, streamBloom >> > (output.devptr, w, h, mips[0].devptr);
+		mip_and_blur_5x5_kernel << <grid, block, tileSize, streamBloom >> > (output.devptr, w, h, mips[0].devptr);
 		w /= 2;
 		h /= 2;
 		grid.x /= 2;
 		grid.y /= 2;
-		mip_and_blur_5x5_kernel << <grid, block, 0, streamBloom >> > (mips[0].devptr, w, h, mips[1].devptr);
+		mip_and_blur_5x5_kernel << <grid, block, tileSize, streamBloom >> > (mips[0].devptr, w, h, mips[1].devptr);
 		w /= 2;
 		h /= 2;
 		grid.x /= 2;
 		grid.y /= 2;
-		mip_and_blur_5x5_kernel << <grid, block, 0, streamBloom >> > (mips[1].devptr, w, h, mips[2].devptr);
+		mip_and_blur_5x5_kernel << <grid, block, tileSize, streamBloom >> > (mips[1].devptr, w, h, mips[2].devptr);
 		w /= 2;
 		h /= 2;
 		grid.x /= 2;
 		grid.y /= 2;
-		mip_and_blur_5x5_kernel << <grid, block, 0, streamBloom >> > (mips[2].devptr, w, h, mips[3].devptr);
+		mip_and_blur_5x5_kernel << <grid, block, tileSize, streamBloom >> > (mips[2].devptr, w, h, mips[3].devptr);
 
 		w = inputWidth;
 		h = inputHeight;
-		grid = dim3(w / BLOCK_DIM, h / BLOCK_DIM);
-		combine_mips_and_blur_5x5_kernel << <grid, block, 0, streamBloom >> > (bloom.devptr, w, h, mips[0].devptr, mips[1].devptr, mips[2].devptr, mips[3].devptr);
+		grid = dim3(w / blockDim, h / blockDim);
+		combine_mips_and_blur_5x5_kernel << <grid, block, tileSize, streamBloom >> > (bloom.devptr, w, h, mips[0].devptr, mips[1].devptr, mips[2].devptr, mips[3].devptr);
 
 		mipBloomEventPair.finish();
 	}
